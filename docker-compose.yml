@@ -1,0 +1,97 @@
+# Two interchangeable edge instances share one durable SQLite database on a
+# named volume; an independent cleaner enforces retention; the one-shot
+# `verify` service exercises both instances over the real network.
+#
+# Host port configuration (clones need only Docker):
+#   API_PORT  -> edge-1 HTTP management API host port   (default 8080)
+#   DNS_PORT  -> edge-1 DNS TCP+UDP host port            (default 5353)
+#   API_PORT_2 / DNS_PORT_2 optionally expose edge-2 as well
+#
+# Acceptance:
+#   docker compose up --build --abort-on-container-exit --exit-code-from verify
+
+name: edgedns
+
+x-edge-env: &edge-env
+  SERVICE_ROLE: edge
+  DB_PATH: /data/dns.db
+  API_PORT: "8080"
+  DNS_PORT: "53"
+
+services:
+  edge-1:
+    build: .
+    image: edgedns:latest
+    command: ["edge"]
+    environment:
+      <<: *edge-env
+      INSTANCE_ID: edge-1
+    volumes:
+      - dnsdata:/data
+    ports:
+      - "${API_PORT:-8080}:8080"
+      - "${DNS_PORT:-5353}:53/tcp"
+      - "${DNS_PORT:-5353}:53/udp"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3); b=json.load(r); sys.exit(0 if r.status==200 and b['status']=='ok' else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  edge-2:
+    image: edgedns:latest
+    build: .
+    command: ["edge"]
+    environment:
+      <<: *edge-env
+      INSTANCE_ID: edge-2
+    volumes:
+      - dnsdata:/data
+    ports:
+      - "${API_PORT_2:-8180}:8080"
+      - "${DNS_PORT_2:-5454}:53/tcp"
+      - "${DNS_PORT_2:-5454}:53/udp"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3); b=json.load(r); sys.exit(0 if r.status==200 and b['status']=='ok' else 1)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  cleaner:
+    image: edgedns:latest
+    command: ["cleaner"]
+    environment:
+      SERVICE_ROLE: cleaner
+      DB_PATH: /data/dns.db
+      CLEAN_INTERVAL: "1"
+    volumes:
+      - dnsdata:/data
+    depends_on:
+      edge-1:
+        condition: service_healthy
+    restart: unless-stopped
+
+  verify:
+    image: edgedns:latest
+    profiles: ["verify"]
+    command: ["verify"]
+    environment:
+      EDGE_HOSTS: "edge-1,edge-2"
+      API_PORT: "8080"
+      DNS_PORT: "53"
+    depends_on:
+      edge-1:
+        condition: service_healthy
+      edge-2:
+        condition: service_healthy
+      cleaner:
+        condition: service_started
+
+volumes:
+  dnsdata:
