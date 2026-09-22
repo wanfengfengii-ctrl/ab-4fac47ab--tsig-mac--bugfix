@@ -124,18 +124,47 @@ def _skip_to_section_end(buf, start, qd, an, ns):
     return off
 
 
+def _signed_base(msg: dict) -> bytes:
+    """RFC 2845 §3.4.2: message bytes before the TSIG RR with ARCOUNT set to
+    the post-TSIG value."""
+    base = msg["raw"][:msg["tsig_offset"]]
+    return w.patch_arcount(base, msg["arcount"])
+
+
+def continue_running_mac(secret: bytes, running_mac: bytes,
+                         raw_unsigned: bytes) -> bytes:
+    """Advance the RFC 2845 running MAC over one unsigned intermediary
+    transfer message exactly as it appeared on the wire."""
+    return w.continue_running_mac(secret, running_mac, raw_unsigned)
+
+
 def verify_response_mac(msg: dict, secret: bytes, prior_mac: bytes,
                         key_name: str, when: int | None = None) -> bytes:
-    """Verify a signed response; returns its MAC for chaining."""
+    """Verify a signed response against the *independent* RFC 2845 formula;
+    returns its MAC for chaining. The prior MAC always carries the two-octet
+    MAC-size prefix (§4.4)."""
     t = msg["tsig"]
-    base = msg["raw"][:msg["tsig_offset"]]
-    base = w.patch_arcount(base, msg["arcount"])
-    block = prior_mac + base + w.tsig_variables(
-        key_name, ALG, t["time"], t["fudge"], t["error"], t["other"])
+    block = (struct.pack(">H", len(prior_mac)) + prior_mac
+             + _signed_base(msg) + w.tsig_variables(
+                 key_name, ALG, t["time"], t["fudge"], t["error"], t["other"]))
     expect = hmac.new(secret, block, hashlib.sha256).digest()
     if not hmac.compare_digest(expect, t["mac"]):
         raise AssertionError("response TSIG MAC mismatch")
     return t["mac"]
+
+
+def reference_request_mac(qname: str, qtype: int, qclass: int, flags: int,
+                          authority: bytes, key_name: str, secret: bytes,
+                          when: int, fudge: int, qid: int) -> bytes:
+    """Independently compute the standard request MAC (RFC 2845 §3.4.2) from
+    scratch, without sharing the server/client message builders."""
+    question = w.encode_name(qname) + struct.pack(">HH", qtype, qclass)
+    nscount = 1 if authority else 0
+    base = struct.pack(">HHHHHH", qid, flags, 1, 0, nscount, 1)
+    base += question + authority
+    block = (w.patch_arcount(base, 1)
+             + w.tsig_variables(key_name, ALG, when, fudge, 0, b""))
+    return hmac.new(secret, block, hashlib.sha256).digest()
 
 
 # ---------------------------------------------------------------------------

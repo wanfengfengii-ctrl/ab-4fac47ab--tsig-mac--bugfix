@@ -352,17 +352,42 @@ def expected_request_mac(key: bytes, q: dict) -> bytes:
     return hmac.new(key, block, hashlib.sha256).digest()
 
 
+def prior_mac_wire(prior_mac: bytes) -> bytes:
+    """RFC 2845 §4.4: whenever a prior digest enters a subsequent MAC it is
+    prefixed with its 16-bit length ("MAC size || MAC"). This applies to the
+    request MAC feeding the first response MAC, the previous response MAC
+    feeding the next signed one, and every unsigned intermediary message."""
+    return struct.pack(">H", len(prior_mac)) + prior_mac
+
+
+def continue_running_mac(key: bytes, running_mac: bytes,
+                         unsigned_message: bytes) -> bytes:
+    """Fold one unsigned intermediary transfer message into the continuous
+    authentication state (RFC 2845 §4.4 / RFC 8945 §5.3.2): the new running
+    MAC is HMAC over ``len16(running) || running || message``. The plain wire
+    message is fed exactly as sent, including its real (zero) ARCOUNT."""
+    block = prior_mac_wire(running_mac) + unsigned_message
+    return hmac.new(key, block, hashlib.sha256).digest()
+
+
 def sign_response(key: bytes, response_no_tsig: bytes, key_name: str,
                   prior_mac: bytes, when: int, fudge: int, orig_id: int,
-                  arcount_before: int) -> tuple[bytes, bytes]:
-    """Sign and append TSIG. Returns (wire, mac). prior_mac is request MAC
-    for the first signed response, or the previous signed response's MAC."""
+                  arcount_before: int, error: int = 0,
+                  other: bytes = b"") -> tuple[bytes, bytes]:
+    """Sign and append TSIG. Returns (wire, mac).
+
+    ``prior_mac`` is the request MAC for the first signed response, or the
+    current running MAC afterwards (which already incorporates every message,
+    signed or unsigned, that preceded this one). It is always fed with the
+    RFC 2845 §4.4 two-octet length prefix."""
     base = patch_arcount(response_no_tsig, arcount_before + 1)
-    block = (prior_mac + base
-             + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, 0, b""))
+    block = (prior_mac_wire(prior_mac) + base
+             + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, error,
+                              other))
     mac = hmac.new(key, block, hashlib.sha256).digest()
     return append_tsig(response_no_tsig, key_name, when, fudge, mac, orig_id,
-                       arcount_before=arcount_before), mac
+                       error=error, arcount_before=arcount_before,
+                       other=other), mac
 
 
 def verify_tsig_time(tsig_time: int, fudge: int, now: int, max_fudge: int = 300
