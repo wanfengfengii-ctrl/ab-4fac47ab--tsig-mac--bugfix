@@ -189,11 +189,16 @@ class TestEndToEnd(unittest.TestCase):
         self.assertTrue(any(r["type"] == w.TYPE_A for r in middle))
         self.assertTrue(any(r["type"] == w.TYPE_TXT for r in middle))
 
-    def test_03b_multi_message_axfr_signs_first_and_last_only(self):
-        # Force a tiny message budget so a small zone spans many TCP messages:
-        # exactly the first and last must carry a verifiable TSIG, middles none.
+    def test_03b_multi_message_axfr_continuous_chain(self):
+        # Force a tiny message budget so a small zone spans many TCP messages.
+        # Only the first and last carry a TSIG (cadence 100 > message count),
+        # but every unsigned middle envelope MUST enter the running MAC, so a
+        # standard RFC 2845 §4.4 verifier (fed all envelopes in order) accepts
+        # both signatures and the complete transfer.
         old_budget = Config.XFER_MESSAGE_BUDGET
+        old_interval = Config.XFER_TSIG_INTERVAL
         Config.XFER_MESSAGE_BUDGET = 300
+        Config.XFER_TSIG_INTERVAL = 100
         try:
             self._create_zone(1)
             ops = soa_ops(2) + [
@@ -210,15 +215,53 @@ class TestEndToEnd(unittest.TestCase):
                     self.assertIsNotNone(m["tsig"], f"msg {i} must be signed")
                 else:
                     self.assertIsNone(m["tsig"], f"middle msg {i} must be unsigned")
-            prior = w.parse_query(q)["tsig"]["mac"]
-            for i, m in enumerate(parsed):
-                if i in (0, len(parsed) - 1):
-                    prior = dc.verify_response_mac(m, sec, prior, kn)
+            verifier = dc.TsigVerifier(sec, kn, w.parse_query(q)["tsig"]["mac"])
+            for i, (m, raw) in enumerate(zip(parsed, msgs)):
+                if m["tsig"] is None:
+                    verifier.feed_unsigned(raw)  # middle enters running digest
+                else:
+                    verifier.verify_signed(m)
             answers = [a for m in msgs for a in dc.parse_message(m)["answers"]]
             self.assertEqual(dc.soa_serial(answers[0]["rdata"]), 2)
             self.assertEqual(dc.soa_serial(answers[-1]["rdata"]), 2)
         finally:
             Config.XFER_MESSAGE_BUDGET = old_budget
+            Config.XFER_TSIG_INTERVAL = old_interval
+
+    def test_03c_periodic_tsig_on_long_transfer(self):
+        # RFC 2845 §4.4: TSIG MUST appear at least every 100 envelopes. With a
+        # two-envelope signing cadence the first, periodic middle and last
+        # signatures must all verify under the continuous running-MAC chain.
+        old_budget = Config.XFER_MESSAGE_BUDGET
+        old_interval = Config.XFER_TSIG_INTERVAL
+        Config.XFER_MESSAGE_BUDGET = 300
+        Config.XFER_TSIG_INTERVAL = 2
+        try:
+            self._create_zone(1)
+            ops = soa_ops(2) + [
+                a_op(f"h{i:02d}", f"192.0.3.{i}") for i in range(2, 14)]
+            http("POST", f"/v1/zones/{self.zone}/publish",
+                 {"requestId": "r", "baseSerial": 1, "nextSerial": 2,
+                  "changes": ops}, want=201)
+            kn, sec = self._install_key()
+            q, msgs = self._transfer(kn, sec, w.TYPE_AXFR)
+            self.assertGreaterEqual(len(msgs), 4)
+            parsed = [dc.parse_message(m) for m in msgs]
+            signed = [i for i, m in enumerate(parsed) if m["tsig"] is not None]
+            self.assertEqual(signed[0], 0)
+            self.assertEqual(signed[-1], len(parsed) - 1)
+            self.assertGreater(len(signed), 2, "expected periodic signatures")
+            for a, b in zip(signed, signed[1:]):
+                self.assertLessEqual(b - a, 2)
+            verifier = dc.TsigVerifier(sec, kn, w.parse_query(q)["tsig"]["mac"])
+            for m, raw in zip(parsed, msgs):
+                if m["tsig"] is None:
+                    verifier.feed_unsigned(raw)
+                else:
+                    verifier.verify_signed(m)
+        finally:
+            Config.XFER_MESSAGE_BUDGET = old_budget
+            Config.XFER_TSIG_INTERVAL = old_interval
 
     def test_04_ixfr_chain_and_equality(self):
         self._create_zone(1)
@@ -447,12 +490,14 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(dc.soa_serial(answers[-1]["rdata"]), 2)
         self.assertEqual(sum(1 for r in answers if r["type"] == w.TYPE_A),
                          n_records)
-        # TSIG chain on first/last still verifies with the (now revoked) key
+        # TSIG chain (all envelopes in order) verifies with the pinned key
         parsed = [dc.parse_message(f) for f in frames]
-        prior = w.parse_query(q)["tsig"]["mac"]
-        for i, m in enumerate(parsed):
-            if i in (0, len(parsed) - 1):
-                prior = dc.verify_response_mac(m, sec, prior, kn)
+        verifier = dc.TsigVerifier(sec, kn, w.parse_query(q)["tsig"]["mac"])
+        for m, raw in zip(parsed, frames):
+            if m["tsig"] is None:
+                verifier.feed_unsigned(raw)
+            else:
+                verifier.verify_signed(m)
 
         # new connections observe the new state: revoked key refused,
         # new key serves serial 3

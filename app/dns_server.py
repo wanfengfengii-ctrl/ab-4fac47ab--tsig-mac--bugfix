@@ -428,73 +428,95 @@ class TCPHandler(socketserver.BaseRequestHandler):
             pass
 
     def _handle_transfer(self, logic: DNSLogic, q: dict) -> None:
-        plan = logic.authorize_transfer(q)
-        snap = None
-        ref_id = plan["refId"]
-        try:
-            # Snapshot is taken after the pin commit: pinned versions cannot be
-            # cleaned, and this WAL read transaction freezes what we stream.
-            snap = logic.db.snapshot_conn()
-            client_serial = q.get("client_soa_serial")
-            if plan["mode"] == "AXFR":
-                qtype = dnswire.TYPE_AXFR
-                rr_iter = logic.axfr_rr_stream(snap, plan)
-            else:
-                qtype = dnswire.TYPE_IXFR
-                rr_iter = logic.ixfr_rr_stream(snap, plan, client_serial)
-            question = _question_for(plan["zone"], qtype)
-            msg_iter = _rr_batches(q["id"], question, rr_iter,
-                                   _transfer_budget(), tsig_space=400)
-            self._stream_signed_transfer(logic, plan, q, msg_iter)
-        finally:
-            if snap is not None:
-                try:
-                    snap.close()
-                except Exception:
-                    pass
-            logic.db.release_transfer(ref_id)
+        # The generator owns the pin and snapshot; they are released when the
+        # generator is exhausted, closed or dropped (e.g. client disconnect).
+        for envelope in transfer_envelopes(logic, q):
+            self.request.sendall(_frame(envelope))
 
-    def _stream_signed_transfer(self, logic, plan, q, msg_iter) -> None:
-        """Send messages as they are produced, signing only the first and the
-        last (RFC 2845) with the running-MAC chain. A one-message lookahead
-        identifies the final message without buffering the whole transfer."""
+
+def _build_signed_envelope(chain: dnswire.TsigChain, plain: bytes, index: int,
+                           last_signed: int | None, is_last: bool,
+                           plan: dict, q: dict, interval: int
+                           ) -> tuple[bytes, int]:
+    """Sign *plain* when RFC 2845 §4.4 requires a TSIG RR (first, last, or
+    every *interval*-th envelope), otherwise feed it into the running MAC and
+    return it unchanged.  Returns (wire envelope, new last_signed index)."""
+    since = 0 if last_signed is None else index - last_signed
+    if index == 0 or is_last or since >= interval:
         when = utcnow()
-        key, key_name = plan["secret"], plan["keyName"]
-        request_mac = q["tsig"]["mac"]
-        first_signed_mac = None
-        index = 0
+        # The first envelope contributes the full TSIG variables; every later
+        # signed envelope (periodic/last) contributes the timers only (4.4).
+        mac = chain.digest_signed(plain, plan["keyName"], when, 300, q["id"],
+                                  full_variables=(index == 0))
+        out = dnswire.append_tsig(plain, plan["keyName"], when, 300, mac,
+                                  q["id"], arcount_before=0)
+        chain.commit(mac)
+        last_signed = index
+    else:
+        # Whole unsigned envelope enters the running digest, in order.
+        chain.include_unsigned(plain)
+        out = plain
+    return out, last_signed
 
-        def send_indexed(i: int, plain: bytes, is_last: bool):
-            nonlocal first_signed_mac
-            if i == 0 or is_last:
-                # First signs chaining from request MAC; last chains from the
-                # first response MAC. When first==last, request MAC is used.
-                if i == 0:
-                    prior = request_mac
-                else:
-                    prior = first_signed_mac
-                signed, mac = dnswire.sign_response(
-                    key, plain, key_name, prior, when, 300, q["id"],
-                    arcount_before=0)
-                if i == 0:
-                    first_signed_mac = mac
-                out = signed
-            else:
-                out = plain
-            self.request.sendall(_frame(out))
+
+def _signed_envelopes(plan: dict, q: dict, msg_iter, interval: int):
+    """Lazily turn plain transfer messages into RFC 2845 §4.4 wire envelopes.
+    A single one-message lookahead identifies the final envelope; the whole
+    zone is never buffered."""
+    chain = dnswire.TsigChain(plan["secret"], q["tsig"]["mac"])
+    index = 0
+    last_signed: int | None = None
+    pending = None
+    for plain in msg_iter:
+        if pending is not None:
+            out, last_signed = _build_signed_envelope(
+                chain, pending, index, last_signed, False, plan, q, interval)
+            yield out
+            index += 1
+        pending = plain
+    # transfers always yield >= 1 message; pending is the final envelope
+    out, _last = _build_signed_envelope(
+        chain, pending, index, last_signed, True, plan, q, interval)
+    yield out
+
+
+def transfer_envelopes(logic: DNSLogic, q: dict, interval: int | None = None):
+    """Transport-free transfer pipeline: authorize, pin, snapshot, stream RRs,
+    batch and RFC 2845-sign -- yielding one wire envelope at a time.
+
+    Suitable for both the TCP handler and direct in-process callers.  The
+    authorization transaction, snapshot cursor and transfer pin live only for
+    the generator's lifetime: exhaust or close the generator to release them.
+    *interval* overrides the periodic-signature cadence (tests only)."""
+    plan = logic.authorize_transfer(q)
+    snap = None
+    ref_id = plan["refId"]
+    cadence = Config.XFER_TSIG_INTERVAL if interval is None else max(1, interval)
+    try:
+        snap = logic.db.snapshot_conn()
+        client_serial = q.get("client_soa_serial")
+        if plan["mode"] == "AXFR":
+            qtype = dnswire.TYPE_AXFR
+            rr_iter = logic.axfr_rr_stream(snap, plan)
+        else:
+            qtype = dnswire.TYPE_IXFR
+            rr_iter = logic.ixfr_rr_stream(snap, plan, client_serial)
+        question = _question_for(plan["zone"], qtype)
+        msg_iter = _rr_batches(q["id"], question, rr_iter,
+                               _transfer_budget(), tsig_space=400)
+        for envelope in _signed_envelopes(plan, q, msg_iter, cadence):
+            yield envelope
             try:
-                logic.db.heartbeat_transfer(plan["refId"])
+                logic.db.heartbeat_transfer(ref_id)
             except Exception:
                 pass
-
-        pending = None
-        for plain in msg_iter:
-            if pending is not None:
-                send_indexed(index, pending, False)
-                index += 1
-            pending = plain
-        # pending is the final message (transfers always yield >=1 message)
-        send_indexed(index, pending, True)
+    finally:
+        if snap is not None:
+            try:
+                snap.close()
+            except Exception:
+                pass
+        logic.db.release_transfer(ref_id)
 
 
 def build_dns_servers(db: Database, ready: dict) -> tuple[_ThreadedUDP,

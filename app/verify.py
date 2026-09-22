@@ -178,18 +178,26 @@ def verify_tsig_chain(msgs: bytes and list, key_name: str, secret: bytes,
                       request_mac: bytes) -> None:
     parsed = [dc.parse_message(m) for m in msgs]
     check("transfer has >=1 message", len(parsed) >= 1)
-    signed_idx = {0, len(parsed) - 1}
-    prior = request_mac
+    # RFC 2845 §4.4: first and last envelopes MUST be signed, and no run of
+    # unsigned envelopes may reach 100. Every envelope (including unsigned
+    # intermediates) enters the continuous running-MAC chain.
+    signed = [i for i, m in enumerate(parsed) if m["tsig"] is not None]
+    check("first envelope TSIG-signed", bool(signed) and signed[0] == 0)
+    check("last envelope TSIG-signed", bool(signed) and signed[-1] == len(parsed) - 1)
+    gap_ok = all(b - a <= 100 for a, b in zip(signed, signed[1:]))
+    check("TSIG present at least every 100 envelopes", gap_ok, str(signed))
+    verifier = dc.TsigVerifier(secret, key_name, request_mac)
     for i, m in enumerate(parsed):
-        if i in signed_idx:
-            try:
-                prior = dc.verify_response_mac(m, secret, prior, key_name)
-                ok = True
-            except Exception as e:
-                ok = False
-            check(f"message {i} TSIG valid (first/last signed)", ok)
-        else:
-            check(f"middle message {i} unsigned", m["tsig"] is None)
+        try:
+            if m["tsig"] is None:
+                verifier.feed_unsigned(msgs[i])
+            else:
+                verifier.verify_signed(m)
+            ok = True
+        except Exception as e:
+            ok = False
+        check(f"message {i} passes continuous TSIG chain verification", ok,
+              "signed" if m["tsig"] is not None else "unsigned")
 
 
 def all_answers(msgs):

@@ -34,15 +34,20 @@ def soa_authority(zone: str, serial: int) -> bytes:
 def build_tsig_query(qid: int, qname: str, qtype: int, key_name: str,
                      secret: bytes, when: int | None = None, fudge: int = 300,
                      authority: bytes = b"") -> bytes:
+    """Build a TSIG-signed query per RFC 2845 §3.4 (request MAC: original ID
+    followed by the message-without-TSIG, with ARCOUNT as it was before the
+    TSIG RR, followed by the TSIG variables)."""
     when = w.utcnow() if when is None else when
     flags = 0x0100  # standard query, RD
     arcount = 1
     base = struct.pack(">HHHHHH", qid, flags, 1, 0, 1 if authority else 0,
                        arcount)
     base += question_wire(qname, qtype) + authority
-    block = (w.patch_arcount(base, arcount)
-             + w.tsig_variables(key_name, ALG, when, fudge, 0, b""))
-    mac = hmac.new(secret, block, hashlib.sha256).digest()
+    h = hmac.new(secret, b"", hashlib.sha256)
+    h.update(struct.pack(">H", qid))
+    h.update(w.patch_arcount(base, arcount - 1)[2:])
+    h.update(w.tsig_variables(key_name, ALG, when, fudge, 0, b""))
+    mac = h.digest()
     rdata = (ALG
              + struct.pack(">HIH", (when >> 32) & 0xFFFF, when & 0xFFFFFFFF,
                            fudge)
@@ -126,16 +131,65 @@ def _skip_to_section_end(buf, start, qd, an, ns):
 
 def verify_response_mac(msg: dict, secret: bytes, prior_mac: bytes,
                         key_name: str, when: int | None = None) -> bytes:
-    """Verify a signed response; returns its MAC for chaining."""
-    t = msg["tsig"]
-    base = msg["raw"][:msg["tsig_offset"]]
-    base = w.patch_arcount(base, msg["arcount"])
-    block = prior_mac + base + w.tsig_variables(
-        key_name, ALG, t["time"], t["fudge"], t["error"], t["other"])
-    expect = hmac.new(secret, block, hashlib.sha256).digest()
-    if not hmac.compare_digest(expect, t["mac"]):
-        raise AssertionError("response TSIG MAC mismatch")
-    return t["mac"]
+    """Verify a standalone signed response (or the *first* envelope of a
+    transfer) per RFC 2845 §3.4.3; returns its MAC for chaining.
+
+    For full multi-envelope transfers (unsigned intermediates, periodic
+    signatures) use :class:`TsigVerifier` instead."""
+    verifier = TsigVerifier(secret, key_name, prior_mac)
+    return verifier.verify_signed(msg)
+
+
+class TsigVerifier:
+    """RFC 2845 §3.4/§4.4 verifier for a stream of TCP response envelopes.
+
+    Feed every envelope in transmission order: :meth:`feed_unsigned` for an
+    envelope without a TSIG RR (its whole wire enters the running digest),
+    :meth:`verify_signed` for an envelope carrying a TSIG RR.  The first
+    signed envelope is validated against the request MAC with the full TSIG
+    variables; later signed envelopes (periodic/last) use the timers-only
+    running digest (RFC 2845 §4.4)."""
+
+    def __init__(self, secret: bytes, key_name: str, request_mac: bytes):
+        self._secret = secret
+        self._key_name = key_name
+        self._signed = 0
+        self._seed(request_mac)
+
+    def _seed(self, prior_mac: bytes) -> None:
+        self._ctx = hmac.new(self._secret, b"", hashlib.sha256)
+        self._ctx.update(struct.pack(">H", len(prior_mac)))
+        self._ctx.update(prior_mac)
+
+    def feed_unsigned(self, raw: bytes) -> None:
+        """Include a complete unsigned envelope exactly as received."""
+        self._ctx.update(raw)
+
+    def verify_signed(self, msg: dict) -> bytes:
+        """Verify a TSIG-bearing envelope; returns its MAC and advances the
+        running digest (re-seeded from that MAC)."""
+        t = msg["tsig"]
+        if t is None:
+            raise AssertionError("envelope carries no TSIG")
+        base = msg["raw"][:msg["tsig_offset"]]
+        base = w.patch_arcount(base, msg["arcount"] - 1)
+        self._ctx.update(struct.pack(">H", t["orig_id"]))
+        self._ctx.update(base[2:])
+        if self._signed == 0:
+            self._ctx.update(w.tsig_variables(
+                self._key_name, ALG, t["time"], t["fudge"],
+                t["error"], t["other"]))
+        else:
+            self._ctx.update(struct.pack(
+                ">HIH", (t["time"] >> 32) & 0xFFFF,
+                t["time"] & 0xFFFFFFFF, t["fudge"]))
+        calc = self._ctx.digest()
+        if not hmac.compare_digest(calc, t["mac"]):
+            raise AssertionError(
+                f"response TSIG MAC mismatch at signed envelope {self._signed}")
+        self._seed(calc)
+        self._signed += 1
+        return t["mac"]
 
 
 # ---------------------------------------------------------------------------

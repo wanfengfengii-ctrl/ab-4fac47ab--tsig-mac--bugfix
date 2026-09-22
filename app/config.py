@@ -39,6 +39,10 @@ class Config:
     XFER_IDLE_TIMEOUT = _int("XFER_IDLE_TIMEOUT", 30)
     # Maximum wire size of a transfer response message before TSIG room.
     XFER_MESSAGE_BUDGET = _int("XFER_MESSAGE_BUDGET", 65000)
+    # RFC 2845 §4.4: a TSIG MUST appear on at least every 100th transfer
+    # envelope (in addition to the first and last). Lower values sign more
+    # often; tests can shrink it to force periodic signatures on small zones.
+    XFER_TSIG_INTERVAL = _int("XFER_TSIG_INTERVAL", 100)
     # Per-connection TCP send buffer: small enough that a slow secondary
     # applies real back-pressure (keeping the transfer pin genuinely alive),
     # large enough not to fragment normal responses.

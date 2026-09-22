@@ -198,16 +198,20 @@ def _tsig_rdata(alg_wire: bytes, when: int, fudge: int, mac: bytes,
 
 def tsig_variables(key_name: str, alg_wire: bytes, when: int, fudge: int,
                    error: int, other: bytes) -> bytes:
-    """The digest-variable block appended to the signed message (RFC 2845
-    §3.4.2): the TSIG RR with MAC Size and MAC omitted."""
-    rdata_no_mac = (alg_wire
-                    + struct.pack(">HIH", (when >> 32) & 0xFFFF,
-                                  when & 0xFFFFFFFF, fudge)
-                    + struct.pack(">H", error) + struct.pack(">H", len(other))
-                    + other)
+    """The TSIG Variables appended to the signed data (RFC 2845 §3.4.2).
+
+    The table in §3.4.2 contributes the TSIG RR's NAME, CLASS and TTL followed
+    by the TSIG RDATA fields (minus MAC Size/MAC): Algorithm, Time Signed,
+    Fudge, Error, Other Len, Other.  Neither the RR TYPE (TSIG) nor the RR's
+    RDLENGTH are part of the digest -- RDLEN "is not included in the hash
+    since it is not guaranteed to be knowable before the MAC is generated"."""
     return (encode_name(key_name)
-            + struct.pack(">HHIH", TYPE_TSIG, CLASS_ANY, 0, len(rdata_no_mac))
-            + rdata_no_mac)
+            + struct.pack(">HI", CLASS_ANY, 0)  # CLASS ANY, TTL 0
+            + alg_wire
+            + struct.pack(">HIH", (when >> 32) & 0xFFFF,
+                          when & 0xFFFFFFFF, fudge)
+            + struct.pack(">HH", error, len(other))
+            + other)
 
 
 def append_tsig(msg: bytes, key_name: str, when: int, fudge: int, mac: bytes,
@@ -332,37 +336,120 @@ def parse_query(buf: bytes) -> dict:
 
 # ---------------------------------------------------------------------------
 # TSIG signing / verification (HMAC-SHA256, server UTC only)
+#
+# The authenticated data is defined by RFC 2845 §3.4:
+#
+#   request (no prior digest):
+#       u16(original ID) | DNS message[2:] pre-TSIG, ARCOUNT pre-TSIG
+#       | TSIG variables (§3.4.2)
+#
+#   first response of a TCP sequence:
+#       u16(request MAC len) | request MAC | u16(original ID)
+#       | DNS message[2:] pre-TSIG, ARCOUNT pre-TSIG | TSIG variables
+#
+#   later signed envelope of a multi-message sequence (§4.4):
+#       running digest, already seeded with the prior MAC and fed the full
+#       wire of every unsigned envelope since the last TSIG, then
+#       u16(original ID) | DNS message[2:] pre-TSIG, ARCOUNT pre-TSIG
+#       | TSIG timers only (Time Signed 48 bit, Fudge 16 bit)
+#
+# After each signed envelope the running digest is re-seeded with that
+# envelope's MAC (the §4.4 "Prior Digest (running)").  TSIG RRs MUST appear on
+# the first and last envelopes and at least once every 100 envelopes.
 # ---------------------------------------------------------------------------
 
-def _digest_block(msg: bytes, tsig_offset: int, final_arcount: int,
-                  key_name: str, when: int, fudge: int, error: int,
-                  other: bytes) -> bytes:
-    # RFC 2845 §3.4.2: the signed base is the message *before* the TSIG RR,
-    # with ARCOUNT adjusted to the value it has after the TSIG is appended.
-    base = msg[:tsig_offset]
-    base = patch_arcount(base, final_arcount)
-    return base + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, error,
-                                 other)
+#: Sign at least on this envelope cadence (RFC 2845 §4.4: every 100th).
+TSIG_MAX_UNSIGNED_ENVELOPES = 100
+
+
+def _tsig_timers(when: int, fudge: int) -> bytes:
+    return struct.pack(">HIH", (when >> 32) & 0xFFFF,
+                       when & 0xFFFFFFFF, fudge)
+
+
+def _message_pre_tsig(raw: bytes, tsig_offset: int, arcount_with_tsig: int
+                      ) -> bytes:
+    """The DNS message without the TSIG RR and with ARCOUNT rewound to the
+    value it had *before* the TSIG RR was added (RFC 2845 §3.4.1)."""
+    pre = raw[:tsig_offset]
+    return patch_arcount(pre, arcount_with_tsig - 1)
 
 
 def expected_request_mac(key: bytes, q: dict) -> bytes:
+    """Standard request MAC (RFC 2845 §3.4.2/§3.4.3, no prior digest)."""
     t = q["tsig"]
-    block = _digest_block(q["raw"], q["tsig_offset"], q["arcount"], t["name"],
-                          t["time"], t["fudge"], t["error"], t["other"])
-    return hmac.new(key, block, hashlib.sha256).digest()
+    base = _message_pre_tsig(q["raw"], q["tsig_offset"], q["arcount"])
+    h = hmac.new(key, b"", hashlib.sha256)
+    h.update(struct.pack(">H", t["orig_id"]))
+    h.update(base[2:])
+    h.update(tsig_variables(t["name"], _ALGORITHM_WIRE, t["time"],
+                            t["fudge"], t["error"], t["other"]))
+    return h.digest()
+
+
+class TsigChain:
+    """Running MAC state for an RFC 2845 §4.4 multi-envelope TCP stream.
+
+    One instance spans the whole transfer on each side.  Signer/verifier
+    feeds every transmitted envelope in order through :meth:`include_unsigned`
+    (unsigned envelopes) or :meth:`digest_signed` (TSIG-bearing envelopes);
+    after each signed envelope :meth:`commit` re-seeds the running digest with
+    the just-produced MAC.
+    """
+
+    def __init__(self, key: bytes, prior_mac: bytes):
+        self.key = key
+        self._reset(prior_mac)
+
+    def _reset(self, prior_mac: bytes) -> None:
+        self.ctx = hmac.new(self.key, b"", hashlib.sha256)
+        self.ctx.update(struct.pack(">H", len(prior_mac)))
+        self.ctx.update(prior_mac)
+
+    def include_unsigned(self, envelope: bytes) -> None:
+        """Feed a complete unsigned envelope exactly as transmitted."""
+        self.ctx.update(envelope)
+
+    def digest_signed(self, message_no_tsig: bytes, key_name: str, when: int,
+                      fudge: int, orig_id: int, full_variables: bool,
+                      error: int = 0, other: bytes = b"") -> bytes:
+        """Finish the MAC for a TSIG-bearing envelope. The first signed
+        envelope contributes full TSIG variables; later ones only the TSIG
+        timers (RFC 2845 §4.4)."""
+        self.ctx.update(struct.pack(">H", orig_id))
+        self.ctx.update(message_no_tsig[2:])
+        if full_variables:
+            self.ctx.update(tsig_variables(key_name, _ALGORITHM_WIRE, when,
+                                           fudge, error, other))
+        else:
+            if error or other:
+                # Error/other-data TSIGs are standalone (first/last) envelopes
+                # and therefore always carry the full variable block.
+                raise ValueError("TSIG error/other requires full variables")
+            self.ctx.update(_tsig_timers(when, fudge))
+        return self.ctx.digest()
+
+    def commit(self, mac: bytes) -> None:
+        """Re-seed the running digest from a signed envelope's MAC."""
+        self._reset(mac)
 
 
 def sign_response(key: bytes, response_no_tsig: bytes, key_name: str,
                   prior_mac: bytes, when: int, fudge: int, orig_id: int,
-                  arcount_before: int) -> tuple[bytes, bytes]:
-    """Sign and append TSIG. Returns (wire, mac). prior_mac is request MAC
-    for the first signed response, or the previous signed response's MAC."""
-    base = patch_arcount(response_no_tsig, arcount_before + 1)
-    block = (prior_mac + base
-             + tsig_variables(key_name, _ALGORITHM_WIRE, when, fudge, 0, b""))
-    mac = hmac.new(key, block, hashlib.sha256).digest()
+                  arcount_before: int, error: int = 0,
+                  other: bytes = b"") -> tuple[bytes, bytes]:
+    """Sign a standalone (single-envelope, or first-envelope) response per
+    RFC 2845 §3.4.3 and append the TSIG RR.  Returns (wire, mac).
+
+    For later envelopes of a multi-message stream use :class:`TsigChain`.
+    """
+    chain = TsigChain(key, prior_mac)
+    mac = chain.digest_signed(response_no_tsig, key_name, when, fudge,
+                              orig_id, full_variables=True,
+                              error=error, other=other)
     return append_tsig(response_no_tsig, key_name, when, fudge, mac, orig_id,
-                       arcount_before=arcount_before), mac
+                       error=error, arcount_before=arcount_before,
+                       other=other), mac
 
 
 def verify_tsig_time(tsig_time: int, fudge: int, now: int, max_fudge: int = 300
